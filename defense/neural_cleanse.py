@@ -21,7 +21,7 @@ class NeuralCleanseConfig(DefenseConfig):
     betas: Tuple[float] = (0.5, 0.9)
     weight_decay: float = 0.0005
     lr_decay_ratio: float = 0.2
-    batch_size: int = 64
+    batch_size: int = 16
 
     init_cost: float = 1e-3
     cost_multiplier: float = 1.5
@@ -152,6 +152,8 @@ class NeuralCleanse(BackdoorDefense):
         mask = tanh_func(atanh_mask)    # (h, w)
         mark = tanh_func(atanh_mark)    # (c, h, w)
 
+        regression_loss = nn.SmoothL1Loss()
+
         optimizer = optim.Adam(
             [atanh_mark, atanh_mask], lr=self.cfg.lr, betas=self.cfg.betas)
         optimizer.zero_grad()
@@ -178,10 +180,11 @@ class NeuralCleanse(BackdoorDefense):
         norm = AverageMeter('Norm', ':.4e')
         acc = AverageMeter('Acc', ':6.2f')
 
-        trainloader = DataLoader(self.dataset,
-                                 batch_size=self.cfg.batch_size,
-                                 shuffle=True,
-                                 pin_memory=True)
+        # trainloader = DataLoader(self.dataset,
+        #                          batch_size=self.cfg.batch_size,
+        #                          shuffle=True,
+        #                          pin_memory=True)
+        trainloader = self.dataset
 
         for _epoch in range(self.cfg.epoch):
             losses.reset()
@@ -201,19 +204,22 @@ class NeuralCleanse(BackdoorDefense):
                     _output = self.model(self.transform(X))
                     batch_acc = Y.eq(_output.argmax(1)).float().mean()
                     batch_entropy = criterion(_output, Y)
+                    acc.update(batch_acc.item(), batch_size)
                 else:
                     _input = _input.to(self.device)
                     for i in range(len(_label)):
-                        _label[i]['labels'] = label*torch.ones_like(_label[i]['labels'], dtype=torch.long)
+                        _label[i]['labels'] = label*torch.ones_like(_label[i]['labels'], dtype=torch.long, device=self.device)
+                        _label[i]['boxes'].to(self.device)
                     X = _input + mask * (mark - _input) # = (1 - mask) + mask * mark
-                    Y = _label
-                    output = self.model(self.transform(X))
-                    batch_entropy = sum([criterion(item['labels'], target['labels']) for item, target in zip(output, _label)])/batch_size
-                    batch_acc = sum([item['scores'] for item in output])
+                    # detections = self.model(self.transform(X), _label)
+                    self.model.training = True
+                    losses = self.model(self.transform(X), _label)
+                    self.model.training = False
+                    batch_entropy = sum(loss for loss in losses.values())
+
                 batch_norm = mask.norm(p=1)
                 batch_loss = batch_entropy + cost * batch_norm
 
-                acc.update(batch_acc.item(), batch_size)
                 entropy.update(batch_entropy.item(), batch_size)
                 norm.update(batch_norm.item(), batch_size)
                 losses.update(batch_loss.item(), batch_size)
